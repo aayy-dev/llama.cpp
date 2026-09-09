@@ -1,0 +1,141 @@
+name: build-all
+
+# Builds upstream llama.cpp on the self-hosted Windows box whenever upstream moves.
+# This workflow lives on the `ci` branch (the fork default branch) so that `master`
+# stays a clean mirror of upstream and can always be fast-forwarded.
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "build even if upstream sha is unchanged"
+        type: boolean
+        default: false
+      ref:
+        description: "upstream ref to build (branch, tag or sha)"
+        type: string
+        default: master
+  schedule:
+    - cron: '0 */6 * * *'
+
+concurrency:
+  group: selfhosted-build
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM: ggml-org/llama.cpp
+  UPSTREAM_REF: ${{ inputs.ref || 'master' }}
+  VS_DEV: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Auxiliary\Build\vcvars64.bat
+
+jobs:
+  check:
+    runs-on: [self-hosted, Windows, X64, nvidia]
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+      changed: ${{ steps.resolve.outputs.changed }}
+    steps:
+      - name: Checkout ci branch
+        uses: actions/checkout@v6
+
+      - name: Resolve upstream sha
+        id: resolve
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          sha=$(gh api "repos/$UPSTREAM/commits/$UPSTREAM_REF" --jq '.sha')
+          last=$(cat state/last-built-sha.txt 2>/dev/null | tr -d '[:space:]' || true)
+          echo "upstream $UPSTREAM_REF -> $sha"
+          echo "last built    -> ${last:-<none>}"
+          if [ "$sha" = "$last" ] && [ "${{ inputs.force }}" != "true" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: check
+    if: needs.check.outputs.changed == 'true'
+    runs-on: [self-hosted, Windows, X64, nvidia]
+
+    strategy:
+      fail-fast: false
+      max-parallel: 1   # one build machine - do not thrash it
+      matrix:
+        include:
+          - backend: cpu
+            defines: ''
+          - backend: cuda
+            defines: '-DGGML_CUDA=ON'
+          - backend: vulkan
+            defines: '-DGGML_VULKAN=ON'
+
+    steps:
+      - name: Checkout upstream @ ${{ needs.check.outputs.sha }}
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.UPSTREAM }}
+          ref: ${{ needs.check.outputs.sha }}
+          fetch-depth: 1
+
+      - name: Configure
+        shell: cmd
+        run: |
+          call "%VS_DEV%" || exit /b 1
+          cmake -S . -B build -G Ninja ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DLLAMA_BUILD_BORINGSSL=ON ^
+            ${{ matrix.defines }} || exit /b 1
+
+      - name: Build
+        shell: cmd
+        run: |
+          call "%VS_DEV%" || exit /b 1
+          cmake --build build -j %NUMBER_OF_PROCESSORS% || exit /b 1
+
+      - name: Test
+        shell: cmd
+        run: |
+          call "%VS_DEV%" || exit /b 1
+          ctest --test-dir build -L main --output-on-failure --timeout 900 || exit /b 1
+
+      - name: ccache stats
+        if: always()
+        shell: cmd
+        run: ccache -s
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $short = "${{ needs.check.outputs.sha }}".Substring(0,9)
+          7z a -snl "llama-${{ matrix.backend }}-$short.zip" .\build\bin\*
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: llama-win-x64-${{ matrix.backend }}
+          path: llama-*.zip
+          retention-days: 14
+
+  record:
+    needs: [check, build]
+    if: success()
+    runs-on: [self-hosted, Windows, X64, nvidia]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Record built sha
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "${{ needs.check.outputs.sha }}" > state/last-built-sha.txt
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state/last-built-sha.txt
+          git diff --staged --quiet || git commit -m "ci: built upstream ${{ needs.check.outputs.sha }}"
+          git push
